@@ -66,6 +66,9 @@ import Hexdump (prettyHex)
 import Numeric (showHex)
 import Witch (into, unsafeInto, tryFrom)
 
+import qualified Prettyprinter as PP
+import Prettyprinter.Render.Terminal
+
 data Signedness = Signed | Unsigned
   deriving (Show)
 
@@ -148,6 +151,9 @@ showError (ConcreteBuf bs) =
                   _             -> formatBinary bs
 showError b = T.pack $ show b
 
+showDoc :: PP.Doc AnsiStyle -> Text 
+showDoc doc = renderStrict (PP.layoutPretty PP.defaultLayoutOptions doc)
+
 -- the conditions under which bytes will be decoded and rendered as a string
 isPrintable :: ByteString -> Bool
 isPrintable =
@@ -185,7 +191,7 @@ showTraceTree dapp vm =
                              , contracts = vm.env.contracts
                              , labels = vm.labels }
   in let forest = traceForest vm
-         traces = fmap (fmap (unpack . showTrace)) forest
+         traces = fmap (fmap (unpack . showDoc . showTrace)) forest
   in pack $ concatMap showTree traces
 
 showTraceTree' :: DappInfo -> Expr End -> Text
@@ -193,18 +199,19 @@ showTraceTree' _ (ITE {}) = internalError "ITE does not contain a trace"
 showTraceTree' dapp leaf =
   let ?context = DappContext { info = dapp, contracts, labels }
   in let forest = traceForest' leaf
-         traces = fmap (fmap (unpack . showTrace)) forest
+         traces = fmap (fmap (unpack . showDoc . showTrace)) forest
   in pack $ concatMap showTree traces
   where TraceContext { contracts, labels } = traceContext leaf
 
-showTrace :: (?context :: DappContext) => Trace -> Text
+showTrace :: (?context :: DappContext) => Trace -> PP.Doc AnsiStyle
 showTrace trace =
   let
     dapp = ?context.info
     pos =
       case showTraceLocation dapp trace of
-        Left x -> " \x1b[1m" <> x <> "\x1b[0m"
-        Right x -> " \x1b[1m(" <> x <> ")\x1b[0m"
+        Left x -> PP.pretty (T.pack " ") <> PP.annotate bold (PP.pretty x)
+        Right x -> PP.pretty (T.pack " ") <> PP.annotate bold (PP.parens $ PP.pretty x)
+
   in case trace.tracedata of
     EventTrace _ bytes topics ->
       case topics of
@@ -245,19 +252,17 @@ showTrace trace =
             Nothing ->
               logn
       where
-        logn = mconcat
-          [ "\x1b[36m"
-          , "log" <> (pack (show (length topics)))
-          , parenthesise ((map (pack . show) topics) ++ [formatSBinary bytes])
-          , "\x1b[0m"
-          ] <> pos
+        logn = PP.annotate (color Cyan) (
+          mconcat
+            [ "log" <> PP.pretty (length topics)
+            , PP.pretty (parenthesise (map (pack . show) topics ++ [formatSBinary bytes]))
+            ])
+          <> pos
 
         showEvent eventName argInfos indexedTopics = mconcat
           [ "emit "
-          , "\x1b[36m"
-          , eventName
-          , "\x1b[0m"
-          , parenthesise (snd <$> sort (unindexedArgs <> indexedArgs))
+          , PP.annotate (color Cyan) (PP.pretty eventName)
+          , PP.pretty (parenthesise (snd <$> sort (unindexedArgs <> indexedArgs)))
           ] <> pos
           where
           -- We maintain the original position of event arguments since indexed
@@ -289,18 +294,16 @@ showTrace trace =
             ]
 
         lognote sig usr = mconcat
-          [ "\x1b[36m"
-          , "LogNote"
-          , parenthesise [sig, usr, "..."]
-          , "\x1b[0m"
+          [ PP.annotate (color Cyan) "LogNote"
+          , PP.pretty (parenthesise [sig, usr, "..."])
           ] <> pos
 
     ErrorTrace e ->
       case e of
         Revert out ->
-          "\x1b[91merror\x1b[0m " <> "Revert " <> showError out <> pos
+          PP.annotate (color Red) "error " <> PP.pretty ("Revert " <> showError out) <> pos
         _ ->
-          "\x1b[91merror\x1b[0m " <> pack (show e) <> pos
+          PP.annotate (color Red) "error " <> PP.pretty (pack (show e)) <> pos
 
     ReturnTrace out (CallContext { abi = Just abi }) ->
       "← " <>
@@ -308,49 +311,47 @@ showTrace trace =
           Just m  ->
             case unzip m.output of
               ([], []) ->
-                formatSBinary out
+                PP.pretty $ formatSBinary out
               (_, ts) ->
-                showValues ts out
+                PP.pretty $ showValues ts out
           Nothing ->
-            formatSBinary out
+            PP.pretty $ formatSBinary out
     ReturnTrace out (CallContext {}) ->
-      "← " <> formatSBinary out
+      PP.pretty ("← " <> formatSBinary out)
     ReturnTrace out (CreationContext {}) ->
       let l = Expr.bufLength out
-      in "← " <> formatExpr l <> " bytes of code"
+      in PP.pretty ("← " <> formatExpr l) <> " bytes of code"
     EntryTrace t ->
-      t
+      PP.pretty t
     FrameTrace (CreationContext { address }) ->
       "create "
-      <> ppAddr address True
+      <> PP.pretty (ppAddr address True)
       <> pos
     FrameTrace (CallContext { target, context, abi, calldata }) ->
       let calltype = if target == context
-                     then "call "
-                     else "delegatecall "
+                    then "call "
+                    else "delegatecall "
       in
       calltype
-      <> ppAddr target False
+      <> PP.pretty (ppAddr target False)
       <> "::"
       <> case findSrcFromAddr target of
         Nothing ->
           case Map.lookup (unsafeInto (fromMaybe 0x00 abi)) dapp.abiMap of
             Just m  ->
-              "\x1b[1m"
-              <> m.name
-              <> "\x1b[0m"
-              <> showCall (catMaybes (getAbiTypes m.methodSignature)) calldata
+              PP.annotate bold (PP.pretty m.name)
+              <> PP.pretty (showCall (catMaybes (getAbiTypes m.methodSignature)) calldata)
             Nothing ->
-              formatSBinary calldata
+              PP.pretty (formatSBinary calldata)
           <> pos
 
-        Just solc ->
+        Just solc -> PP.pretty (
           maybe "[fallback function]"
-                 (fromMaybe "[unknown method]" . maybeAbiName solc)
-                 abi
+                (fromMaybe "[unknown method]" . maybeAbiName solc)
+                abi
           <> maybe ("(" <> formatSBinary calldata <> ")")
-                   (\x -> showCall (catMaybes x) calldata)
-                   (abi >>= fmap getAbiTypes . maybeAbiName solc)
+                  (\x -> showCall (catMaybes x) calldata)
+                  (abi >>= fmap getAbiTypes . maybeAbiName solc))
           <> pos
     where
     findSrcFromAddr addr = do
